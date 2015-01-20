@@ -1,0 +1,9 @@
+[package]
+
+name = "mpack"
+version = "0.0.1"
+authors = ["Damien Radtke"]
+
+description = "A new MessagePack implementation for Rust."
+repository = "https://github.com/dradtke/mpack.git"
+license = "MIT"
