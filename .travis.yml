@@ -1,7 +1,14 @@
 language: rust
 
+env:
+  global:
+    - secure: C5k8mYlzq1IwhbbLvmvUFUjwlXYbiUgqFWEENl21hEu24THFv1y83t4qmNzRfMCSObS74UFWUkZbEa8bYm1OBfYXs28nGZcWta7trbS6RsALoHLFHOZh+1JYvkM3pbO6AphLq9kcXbHCIMxlRKvvTgA8rTnKdyc4Slwn747x3dc=
+
 script:
   - cargo build --verbose
   - cargo test --verbose
 
-# TODO: add support for building documentation
+after_script:
+- cargo doc --verbose
+- cp -R target/doc doc
+- curl http://www.rust-ci.org/artifacts/put?t=$RUSTCI_TOKEN | sh
