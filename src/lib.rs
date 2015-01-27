@@ -15,19 +15,22 @@
 //! are implemented, but this will hopefully change soon.
 
 #![crate_type = "lib"]
+#![feature(unsafe_destructor)]
 #![allow(dead_code, unstable)]
 
-use std::io::IoResult;
+use std::error::{Error, FromError};
+use std::io::{IoError, IoResult};
 use std::string;
 
 mod byte;
+mod rpc;
 
 macro_rules! nth_byte(
     ($x:expr, $n:expr) => ((($x >> ($n * 8)) & 0xFF) as u8)
 );
 
 /// A value that can be sent by `msgpack`.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Show)]
 #[stable]
 pub enum Value {
     #[stable] Nil,
@@ -51,6 +54,44 @@ pub enum Value {
     #[unstable] Extended(i8, Vec<u8>),
 }
 
+impl Value {
+    fn int(self) -> i64 {
+        use Value::*;
+        match self {
+            Int8(i) => i as i64,
+            Int16(i) => i as i64,
+            Int32(i) => i as i64,
+            Int64(i) => i,
+            x => panic!("'{:?}' does not contain an int value", x),
+        }
+    }
+
+    fn uint(self) -> u64 {
+        use Value::*;
+        match self {
+            Uint8(i) => i as u64,
+            Uint16(i) => i as u64,
+            Uint32(i) => i as u64,
+            Uint64(i) => i,
+            x => panic!("'{:?}' does not contain a uint value", x),
+        }
+    }
+
+    fn string(self) -> string::String {
+        match self {
+            Value::String(s) => s,
+            _ => panic!("not a string value"),
+        }
+    }
+
+    fn array(self) -> Vec<Value> {
+        match self {
+            Value::Array(ar) => ar,
+            _ => panic!("not an array value"),
+        }
+    }
+}
+
 /// A trait for types that can be written via MessagePack. This is mostly
 /// a convenience to avoid having to wrap them yourself each time.
 #[stable]
@@ -58,53 +99,19 @@ pub trait IntoValue {
     fn into_value(self) -> Value;
 }
 
-impl IntoValue for bool {
-    fn into_value(self) -> Value { Value::Boolean(self) }
-}
-
-impl IntoValue for u8 {
-    fn into_value(self) -> Value { Value::Uint8(self) }
-}
-
-impl IntoValue for u16 {
-    fn into_value(self) -> Value { Value::Uint16(self) }
-}
-
-impl IntoValue for u32 {
-    fn into_value(self) -> Value { Value::Uint32(self) }
-}
-
-impl IntoValue for u64 {
-    fn into_value(self) -> Value { Value::Uint64(self) }
-}
-
-impl IntoValue for i8 {
-    fn into_value(self) -> Value { Value::Int8(self) }
-}
-
-impl IntoValue for i16 {
-    fn into_value(self) -> Value { Value::Int16(self) }
-}
-
-impl IntoValue for i32 {
-    fn into_value(self) -> Value { Value::Int32(self) }
-}
-
-impl IntoValue for i64 {
-    fn into_value(self) -> Value { Value::Int64(self) }
-}
-
-impl IntoValue for f32 {
-    fn into_value(self) -> Value { Value::Float32(self) }
-}
-
-impl IntoValue for f64 {
-    fn into_value(self) -> Value { Value::Float64(self) }
-}
-
-impl IntoValue for string::String {
-    fn into_value(self) -> Value { Value::String(self) }
-}
+impl IntoValue for () { fn into_value(self) -> Value { Value::Nil } }
+impl IntoValue for bool { fn into_value(self) -> Value { Value::Boolean(self) } }
+impl IntoValue for u8 { fn into_value(self) -> Value { Value::Uint8(self) } }
+impl IntoValue for u16 { fn into_value(self) -> Value { Value::Uint16(self) } }
+impl IntoValue for u32 { fn into_value(self) -> Value { Value::Uint32(self) } }
+impl IntoValue for u64 { fn into_value(self) -> Value { Value::Uint64(self) } }
+impl IntoValue for i8 { fn into_value(self) -> Value { Value::Int8(self) } }
+impl IntoValue for i16 { fn into_value(self) -> Value { Value::Int16(self) } }
+impl IntoValue for i32 { fn into_value(self) -> Value { Value::Int32(self) } }
+impl IntoValue for i64 { fn into_value(self) -> Value { Value::Int64(self) } }
+impl IntoValue for f32 { fn into_value(self) -> Value { Value::Float32(self) } }
+impl IntoValue for f64 { fn into_value(self) -> Value { Value::Float64(self) } }
+impl IntoValue for string::String { fn into_value(self) -> Value { Value::String(self) } }
 
 // TODO: re-enable this when we can specify that the implementation
 // for Vec<T> should *not* include u8
@@ -143,12 +150,26 @@ pub fn write<W: Writer, V: IntoValue>(dest: &mut W, val: V) -> IoResult<()> {
     write_value(dest, val.into_value())
 }
 
+/// Write any value as an Extended type.
+///
+/// The `val` parameter will be automatically converted to its byte representation.
+#[unstable = "exact API may change"]
+pub fn write_ext<W: Writer, T>(dest: &mut W, id: i8, val: T) -> IoResult<()> {
+    let data: &[u8] = unsafe {
+        std::mem::transmute(std::raw::Slice {
+            data: &val as *const _ as *const u8,
+            len: std::mem::size_of::<T>(),
+        })
+    };
+    write_value(dest, Value::Extended(id, data.to_vec()))
+}
+
 /// Write a message in MessagePack format for the given value.
 #[unstable = "exact API may change"]
 pub fn write_value<W: Writer>(dest: &mut W, val: Value) -> IoResult<()> {
     use Value::*;
 
-    try!(match val {
+    match val {
         Nil => dest.write_u8(byte::NIL),
 
         Boolean(false) => dest.write_u8(byte::FALSE),
@@ -257,15 +278,43 @@ pub fn write_value<W: Writer>(dest: &mut W, val: Value) -> IoResult<()> {
             Ok(())
         },
 
-        Extended(..) => unimplemented!(),
-    });
+        Extended(id, data) => {
+            let n = data.len();
+            try!(match n {
+                1 => { dest.write_u8(byte::FIXEXT1) },
+                2 => { dest.write_u8(byte::FIXEXT2) },
+                4 => { dest.write_u8(byte::FIXEXT4) },
+                8 => { dest.write_u8(byte::FIXEXT8) },
+                16 => { dest.write_u8(byte::FIXEXT16) },
 
-    dest.flush()
+                0...255 => { // ext 8
+                    dest.write(&[byte::EXT8, n as u8])
+                },
+                256...65535 => { // ext 16
+                    try!(dest.write_u8(byte::EXT16));
+                    dest.write_be_u16(n as u16)
+                },
+                65536...4294967295 => { // ext 32
+                    try!(dest.write_u8(byte::EXT32));
+                    dest.write_be_u32(n as u32)
+                },
+
+                _ => panic!("custom value too long! {} bytes is too many!", n),
+            });
+            try!(dest.write_i8(id));
+            dest.write(data.as_slice())
+        },
+    }
 }
 
 /// Read a MessagePack message from the given `Reader`.
+///
+/// Ideally this method would just peek at the first byte
+/// to see if it recognizes it as a format id, but plain
+/// Readers don't support that, so for now we just consume
+/// it and return the unrecognized byte as part of the error.
 #[unstable = "the exact signature may change"]
-pub fn read_value<R: Reader>(src: &mut R) -> IoResult<Value> {
+pub fn read_value<R: Reader>(src: &mut R) -> Result<Value, ReadError> {
     use Value::*;
 
     match try!(src.read_byte()) {
@@ -393,105 +442,97 @@ pub fn read_value<R: Reader>(src: &mut R) -> IoResult<Value> {
         },
 
         // Extension types.
-        0xD4...0xD8 | 0xC7...0xC9 => unimplemented!(),
+        byte::FIXEXT1 => Ok(Extended(try!(src.read_i8()), try!(src.read_exact(1)))),
+        byte::FIXEXT2 => Ok(Extended(try!(src.read_i8()), try!(src.read_exact(2)))),
+        byte::FIXEXT4 => Ok(Extended(try!(src.read_i8()), try!(src.read_exact(4)))),
+        byte::FIXEXT8 => Ok(Extended(try!(src.read_i8()), try!(src.read_exact(8)))),
+        byte::FIXEXT16 => Ok(Extended(try!(src.read_i8()), try!(src.read_exact(16)))),
 
-        x => panic!("unrecognized format identifier: {}", x),
+        byte::EXT8 => {
+            let n = try!(src.read_u8()) as usize;
+            Ok(Extended(try!(src.read_i8()), try!(src.read_exact(n))))
+        },
+
+        byte::EXT16 => {
+            let n = try!(src.read_be_u16()) as usize;
+            Ok(Extended(try!(src.read_i8()), try!(src.read_exact(n))))
+        },
+
+        byte::EXT32 => {
+            let n = try!(src.read_be_u32()) as usize;
+            Ok(Extended(try!(src.read_i8()), try!(src.read_exact(n))))
+        },
+
+        x => Err(ReadError::Unrecognized(x)),
     }
 }
 
-// TODO: fix up tests
-/*
-#[cfg(test)]
-mod test {
-    use std::io::{ChanReader, ChanWriter};
-    use std::sync::mpsc::channel;
-    use std::rand::{Rng, StdRng};
-    use std::string;
-    use super::{Value, read_value, write_value};
+/* -- Errors -- */
 
-    fn compare(val: Value) {
-        let (tx, rx) = channel();
-        write(&mut ChanWriter::new(tx), val.clone()).ok();
-        match read_value(&mut ChanReader::new(rx)).unwrap() {
-            ref x if *x == val => (),
-            _ => panic!("received unexpected value"),
+/// An error encountered while trying to read a value.
+#[stable]
+#[derive(Show)]
+pub enum ReadError {
+    #[stable] Io(IoError),
+    #[stable] Unrecognized(u8),
+}
+
+impl Error for ReadError {
+    fn description(&self) -> &str { "read error" }
+    fn cause(&self) -> Option<&Error> {
+        match *self {
+            ReadError::Io(ref e) => Some(e as &Error),
+            ReadError::Unrecognized(_) => None,
         }
-    }
-
-    fn random_string(n: usize) -> string::String {
-        let mut rng = StdRng::new().unwrap();
-        let values: &[char] = &['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'];
-
-        let mut s = string::String::with_capacity(n);
-        for _ in range(0, n) {
-            s.push(*rng.choose(values).unwrap());
-        }
-        s
-    }
-
-    #[test]
-    fn test_u8() {
-        compare(Value::Uint8(3));
-    }
-
-    #[test]
-    fn test_u16() {
-        compare(Value::Uint16(36));
-    }
-
-    #[test]
-    fn test_u32() {
-        compare(Value::Uint32(360));
-    }
-
-    #[test]
-    fn test_u64() {
-        compare(Value::Uint64(360));
-    }
-
-    #[test]
-    fn test_i8() {
-        compare(Value::Int8(3));
-    }
-
-    #[test]
-    fn test_i16() {
-        compare(Value::Int16(36));
-    }
-
-    #[test]
-    fn test_i32() {
-        compare(Value::Int32(360));
-    }
-
-    #[test]
-    fn test_i64() {
-        compare(Value::Int64(360));
-    }
-
-    #[test]
-    fn test_f32() {
-        compare(Value::Float32(1234.56));
-    }
-
-    #[test]
-    fn test_f64() {
-        compare(Value::Float64(123456.78));
-    }
-
-    #[test]
-    fn write_tiny_string() {
-        compare(Value::String(random_string(8)));
-    }
-
-    #[test]
-    fn write_short_string() {
-        compare(Value::String(random_string(32)));
-    }
-
-    #[test]
-    fn write_medium_string() {
-        compare(Value::String(random_string(256)));
     }
 }
-*/
+
+impl FromError<IoError> for ReadError {
+    fn from_error(e: IoError) -> ReadError { ReadError::Io(e) }
+}
+
+//#[cfg(test)]
+//mod test {
+//    use std::io::{ChanReader, ChanWriter};
+//    use std::sync::mpsc::channel;
+//    use std::rand::{Rng, StdRng};
+//    use std::string;
+//    use super::{IntoValue, read_value, write_value};
+//
+//    const LETTERS: &'static [char] = &['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'];
+//
+//    fn test<T: IntoValue>(arg: T) {
+//        let val = arg.into_value();
+//        let (tx, rx) = channel();
+//        write_value(&mut ChanWriter::new(tx), val.clone()).unwrap();
+//        assert_eq!(read_value(&mut ChanReader::new(rx)).unwrap(), val);
+//    }
+//
+//    fn random_string(n: usize) -> string::String {
+//        let mut rng = StdRng::new().unwrap();
+//
+//        let mut s = string::String::with_capacity(n);
+//        for _ in range(0, n) {
+//            s.push(*rng.choose(LETTERS).unwrap());
+//        }
+//        s
+//    }
+//
+//    #[test] fn test_nil() { test(()); }
+//
+//    #[test] fn test_u8() { test(3 as u8); }
+//    #[test] fn test_u16() { test(36 as u16); }
+//    #[test] fn test_u32() { test(360 as u32); }
+//    #[test] fn test_u64() { test(3600 as u64); }
+//    #[test] fn test_i8() { test(3 as i8); }
+//    #[test] fn test_i16() { test(36 as i16); }
+//    #[test] fn test_i32() { test(360 as i32); }
+//    #[test] fn test_i64() { test(3600 as i64); }
+//
+//    #[test] fn test_f32() { test(1234.56 as f32); }
+//    #[test] fn test_f64() { test(123456.78 as f64); }
+//
+//    #[test] fn write_tiny_string() { test(random_string(8)); }
+//    #[test] fn write_short_string() { test(random_string(32)); }
+//    #[test] fn write_medium_string() { test(random_string(256)); }
+//}

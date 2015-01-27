@@ -28,3 +28,13 @@ pub const AR32:  u8 = 0xDD;
 
 pub const MAP16: u8 = 0xDE;
 pub const MAP32: u8 = 0xDF;
+
+pub const FIXEXT1:  u8 = 0xD4;
+pub const FIXEXT2:  u8 = 0xD5;
+pub const FIXEXT4:  u8 = 0xD6;
+pub const FIXEXT8:  u8 = 0xD7;
+pub const FIXEXT16: u8 = 0xD8;
+
+pub const EXT8:  u8 = 0xC7;
+pub const EXT16: u8 = 0xC8;
+pub const EXT32: u8 = 0xC9;
