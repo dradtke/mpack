@@ -487,52 +487,59 @@ impl Error for ReadError {
     }
 }
 
+// For some reason the Error implementation barks if you don't do this.
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(fmt, "{}", self)
+    }
+}
+
 impl FromError<IoError> for ReadError {
     fn from_error(e: IoError) -> ReadError { ReadError::Io(e) }
 }
 
-//#[cfg(test)]
-//mod test {
-//    use std::io::{ChanReader, ChanWriter};
-//    use std::sync::mpsc::channel;
-//    use std::rand::{Rng, StdRng};
-//    use std::string;
-//    use super::{IntoValue, read_value, write_value};
-//
-//    const LETTERS: &'static [char] = &['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'];
-//
-//    fn test<T: IntoValue>(arg: T) {
-//        let val = arg.into_value();
-//        let (tx, rx) = channel();
-//        write_value(&mut ChanWriter::new(tx), val.clone()).unwrap();
-//        assert_eq!(read_value(&mut ChanReader::new(rx)).unwrap(), val);
-//    }
-//
-//    fn random_string(n: usize) -> string::String {
-//        let mut rng = StdRng::new().unwrap();
-//
-//        let mut s = string::String::with_capacity(n);
-//        for _ in range(0, n) {
-//            s.push(*rng.choose(LETTERS).unwrap());
-//        }
-//        s
-//    }
-//
-//    #[test] fn test_nil() { test(()); }
-//
-//    #[test] fn test_u8() { test(3 as u8); }
-//    #[test] fn test_u16() { test(36 as u16); }
-//    #[test] fn test_u32() { test(360 as u32); }
-//    #[test] fn test_u64() { test(3600 as u64); }
-//    #[test] fn test_i8() { test(3 as i8); }
-//    #[test] fn test_i16() { test(36 as i16); }
-//    #[test] fn test_i32() { test(360 as i32); }
-//    #[test] fn test_i64() { test(3600 as i64); }
-//
-//    #[test] fn test_f32() { test(1234.56 as f32); }
-//    #[test] fn test_f64() { test(123456.78 as f64); }
-//
-//    #[test] fn write_tiny_string() { test(random_string(8)); }
-//    #[test] fn write_short_string() { test(random_string(32)); }
-//    #[test] fn write_medium_string() { test(random_string(256)); }
-//}
+#[cfg(test)]
+mod test {
+    use std::io::{ChanReader, ChanWriter};
+    use std::sync::mpsc::channel;
+    use std::rand::{Rng, StdRng};
+    use std::string;
+    use super::{IntoValue, read_value, write_value};
+
+    const LETTERS: &'static [char] = &['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'];
+
+    fn test<T: IntoValue>(arg: T) {
+        let val = arg.into_value();
+        let (tx, rx) = channel();
+        write_value(&mut ChanWriter::new(tx), val.clone()).unwrap();
+        assert_eq!(read_value(&mut ChanReader::new(rx)).unwrap(), val);
+    }
+
+    fn random_string(n: usize) -> string::String {
+        let mut rng = StdRng::new().unwrap();
+
+        let mut s = string::String::with_capacity(n);
+        for _ in range(0, n) {
+            s.push(*rng.choose(LETTERS).unwrap());
+        }
+        s
+    }
+
+    #[test] fn test_nil() { test(()); }
+
+    #[test] fn test_u8() { test(3 as u8); }
+    #[test] fn test_u16() { test(36 as u16); }
+    #[test] fn test_u32() { test(360 as u32); }
+    #[test] fn test_u64() { test(3600 as u64); }
+    #[test] fn test_i8() { test(3 as i8); }
+    #[test] fn test_i16() { test(36 as i16); }
+    #[test] fn test_i32() { test(360 as i32); }
+    #[test] fn test_i64() { test(3600 as i64); }
+
+    #[test] fn test_f32() { test(1234.56 as f32); }
+    #[test] fn test_f64() { test(123456.78 as f64); }
+
+    #[test] fn write_tiny_string() { test(random_string(8)); }
+    #[test] fn write_short_string() { test(random_string(32)); }
+    #[test] fn write_medium_string() { test(random_string(256)); }
+}

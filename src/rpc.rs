@@ -26,9 +26,11 @@ impl<R, W> Client<R, W> where R: Reader + Send, W: Writer + Send {
             Thread::spawn(move || {
                 loop {
                     match read_value(&mut reader) {
-                        Ok(value) => assert_eq!(value.int(), 1),
+                        Ok(Value::Int8(1)) => (), // response
+                        Ok(value) => panic!("unexpected value; expected 1i8, got {:?}", value),
+                        Err(super::ReadError::Unrecognized(0)) => break, // kill signal
                         Err(super::ReadError::Io(ref e)) if e.kind == IoErrorKind::EndOfFile => break,
-                        _ => panic!("read non-response message type"),
+                        Err(e) => panic!("error: {}", e),
                     }
 
                     match read_value(&mut reader) {
@@ -67,9 +69,13 @@ impl<R, W> Client<R, W> where R: Reader + Send, W: Writer + Send {
 }
 
 #[unsafe_destructor]
-impl<R, W> Drop for Client<R, W> where R: Drop, W: Drop {
+impl<R, W> Drop for Client<R, W> where W: Writer {
     fn drop(&mut self) {
-        // TODO: kill the client's threads
+        match self.output.write_u8(0) {
+            Ok(_) => (),
+            Err(ref e) if e.kind == IoErrorKind::BrokenPipe => (), // already closed, no need to kill it
+            Err(e) => panic!("{}", e),
+        }
     }
 }
 
@@ -99,7 +105,7 @@ mod test {
 
             match method.as_slice() {
                 "ping" => {
-                    write(&mut sw, 1).unwrap();
+                    write(&mut sw, 1 as i8).unwrap();
                     write_value(&mut sw, Value::Uint32(msgid)).unwrap();
                     write(&mut sw, ()).unwrap(); // error
                     write(&mut sw, "pong".to_string()).unwrap(); // value
@@ -131,6 +137,7 @@ mod test {
                 match read_value(&mut cr) {
                     Ok(value) => assert_eq!(value.int(), 0),
                     Err(ReadError::Io(ref e)) if e.kind == IoErrorKind::EndOfFile => break,
+                    Err(ReadError::Unrecognized(0)) => break,
                     x => panic!("received unexpected value '{:?}'", x),
                 }
 
@@ -145,7 +152,7 @@ mod test {
                     let mut params = params;
 
                     macro_rules! echo(() => ({
-                        write(&mut sw, 1).unwrap();
+                        write(&mut sw, 1 as i8).unwrap();
                         write_value(&mut sw, Value::Uint32(msgid)).unwrap();
                         write(&mut sw, ()).unwrap(); // error
                         write_value(&mut sw, params.swap_remove(0)).unwrap(); // value
