@@ -7,23 +7,17 @@
 //! away from Rust's old serialization story. This implementation
 //! foregoes usage of `rustc-serialize` (at least until a new approach
 //! stabilizes) in favor of operating directly on `Reader` and `Writer`.
-//!
-//! One thing to note is that the `Value::Extended` type is
-//! currently just a placeholder, and is not yet implemented.
-//! Only MessagePack's builtin formats as defined in the
-//! [spec](https://github.com/msgpack/msgpack/blob/master/spec.md)
-//! are implemented, but this will hopefully change soon.
 
 #![crate_type = "lib"]
-#![feature(unsafe_destructor)]
-#![allow(dead_code, unstable)]
+#![feature(core, io, std_misc, unsafe_destructor)]
+#![allow(dead_code)]
 
 use std::error::{Error, FromError};
-use std::io::{IoError, IoResult};
+use std::old_io::{IoError, IoResult};
 use std::string;
 
 mod byte;
-mod rpc;
+pub mod rpc;
 
 macro_rules! nth_byte(
     ($x:expr, $n:expr) => ((($x >> ($n * 8)) & 0xFF) as u8)
@@ -88,6 +82,16 @@ impl Value {
         match self {
             Value::Array(ar) => ar,
             _ => panic!("not an array value"),
+        }
+    }
+
+    fn get<T: IntoValue>(&self, key: T) -> Option<&Value> {
+        let key = key.into_value();
+        match *self {
+            Value::Map(ref map) => {
+                map.iter().find(|&&(ref k, _)| *k == key).map(|&(_, ref v)| v)
+            },
+            _ => panic!("not a map value"),
         }
     }
 }
@@ -175,7 +179,7 @@ pub fn write_value<W: Writer>(dest: &mut W, val: Value) -> IoResult<()> {
         Boolean(false) => dest.write_u8(byte::FALSE),
         Boolean(true) => dest.write_u8(byte::TRUE),
 
-        Uint8(x) => dest.write(&[byte::U8, x]),
+        Uint8(x) => dest.write_all(&[byte::U8, x]),
         Uint16(x) => { try!(dest.write_u8(byte::U16)); try!(dest.write_be_u16(x)); Ok(()) },
         Uint32(x) => { try!(dest.write_u8(byte::U32)); try!(dest.write_be_u32(x)); Ok(()) },
         Uint64(x) => { try!(dest.write_u8(byte::U64)); try!(dest.write_be_u64(x)); Ok(()) },
@@ -196,7 +200,7 @@ pub fn write_value<W: Writer>(dest: &mut W, val: Value) -> IoResult<()> {
                     try!(dest.write_u8((0b10100000 | n) as u8));
                 },
                 32...255 => { // str 8
-                    try!(dest.write(&[byte::STR8, n as u8]));
+                    try!(dest.write_all(&[byte::STR8, n as u8]));
                 },
                 256...65535 => { // str 16
                     try!(dest.write_u8(byte::STR16));
@@ -208,7 +212,7 @@ pub fn write_value<W: Writer>(dest: &mut W, val: Value) -> IoResult<()> {
                 },
                 _ => panic!("string too long! {} bytes is too many!", n),
             }
-            try!(dest.write(bytes));
+            try!(dest.write_all(bytes));
             Ok(())
         },
 
@@ -216,7 +220,7 @@ pub fn write_value<W: Writer>(dest: &mut W, val: Value) -> IoResult<()> {
             let n = b.len();
             match n {
                 0...255 => { // bin 8
-                    try!(dest.write(&[byte::BIN8, n as u8]));
+                    try!(dest.write_all(&[byte::BIN8, n as u8]));
                 },
                 256...65535 => { // bin 16
                     try!(dest.write_u8(byte::BIN16));
@@ -229,7 +233,7 @@ pub fn write_value<W: Writer>(dest: &mut W, val: Value) -> IoResult<()> {
                 // TODO: encode the other lengths
                 _ => panic!("binary data too long! {} bytes is too many!", n),
             }
-            try!(dest.write(b.as_slice()));
+            try!(dest.write_all(b.as_slice()));
             Ok(())
         },
 
@@ -288,7 +292,7 @@ pub fn write_value<W: Writer>(dest: &mut W, val: Value) -> IoResult<()> {
                 16 => { dest.write_u8(byte::FIXEXT16) },
 
                 0...255 => { // ext 8
-                    dest.write(&[byte::EXT8, n as u8])
+                    dest.write_all(&[byte::EXT8, n as u8])
                 },
                 256...65535 => { // ext 16
                     try!(dest.write_u8(byte::EXT16));
@@ -302,7 +306,7 @@ pub fn write_value<W: Writer>(dest: &mut W, val: Value) -> IoResult<()> {
                 _ => panic!("custom value too long! {} bytes is too many!", n),
             });
             try!(dest.write_i8(id));
-            dest.write(data.as_slice())
+            dest.write_all(data.as_slice())
         },
     }
 }
@@ -500,7 +504,7 @@ impl FromError<IoError> for ReadError {
 
 #[cfg(test)]
 mod test {
-    use std::io::{ChanReader, ChanWriter};
+    use std::old_io::{ChanReader, ChanWriter};
     use std::sync::mpsc::channel;
     use std::rand::{Rng, StdRng};
     use std::string;
