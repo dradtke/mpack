@@ -139,45 +139,42 @@ impl<'c, R, W> Drop for Client<'c, R, W> where W: Write {
 
 #[cfg(test)]
 mod test {
-    use std::old_io::{ChanReader, ChanWriter, IoErrorKind};
-    use std::old_io::timer::sleep;
-    use std::sync::mpsc::{channel};
-    use std::thread::Thread;
+    use std::sync::mpsc::channel;
+    use std::thread;
     use std::time::duration::Duration;
+
     use super::Client;
     use super::super::{Value, ReadError, write, write_value};
 
-    /// This test just calls a method "ping" and expects the result "pong".
+    // This test just calls a method "ping" and expects the result "pong".
     #[test] fn simple_test() {
         let (cw, cr) = channel();
         let (sw, sr) = channel();
 
-        let guard = Thread::scoped(move || {
-            let mut cr = ChanReader::new(cr);
-            let mut sw = ChanWriter::new(sw);
+        thread::spawn(move || {
+            let mut reader = ::Reader::new(::test::ChanReader(cr));
+            let mut writer = ::test::ChanWriter(sw);
 
-            assert_eq!(cr.read_value().unwrap().int(), 0);
-            let msgid = cr.read_value().unwrap().uint() as u32;
-            let method = cr.read_value().unwrap().string();
-            let _ = cr.read_value().unwrap().array(); // params
+            assert_eq!(reader.read_value().unwrap().int(), 0);
+            let msgid = reader.read_value().unwrap().uint() as u32;
+            let method = reader.read_value().unwrap().string();
+            let _ = reader.read_value().unwrap().array(); // params
 
             match method.as_slice() {
                 "ping" => {
-                    write(&mut sw, 1 as i8).unwrap();
-                    write_value(&mut sw, Value::Uint32(msgid)).unwrap();
-                    write(&mut sw, ()).unwrap(); // error
-                    write(&mut sw, "pong".to_string()).unwrap(); // value
+                    write(&mut writer, 1 as i8).unwrap();
+                    write_value(&mut writer, Value::Uint32(msgid)).unwrap();
+                    write(&mut writer, ()).unwrap(); // error
+                    write(&mut writer, "pong".to_string()).unwrap(); // value
                 },
                 m => panic!("didn't expect you to call method '{}'", m),
             }
         });
 
-        let mut client = Client::new(ChanReader::new(sr), ChanWriter::new(cw));
+        let mut client = Client::new(::test::ChanReader(sr), ::test::ChanWriter(cw));
         let mut value_future = client.call("ping".to_string(), vec![]).unwrap();
         let value = value_future.get().unwrap();
         assert_eq!(value, Value::String("pong".to_string()));
-
-        assert!(guard.join().is_ok());
     }
 
     /// This method verifies the correctness of mismatched response times by calling
@@ -187,33 +184,33 @@ mod test {
         let (cw, cr) = channel();
         let (sw, sr) = channel();
 
-        Thread::spawn(move || {
-            let mut cr = ChanReader::new(cr);
-            let sw = ChanWriter::new(sw);
+        thread::spawn(move || {
+            let mut reader = ::Reader::new(::test::ChanReader(cr));
 
             loop {
-                match cr.read_value() {
+                match reader.read_value() {
                     Ok(value) => assert_eq!(value.int(), 0),
-                    Err(ReadError::Io(ref e)) if e.kind == IoErrorKind::EndOfFile => break,
                     Err(ReadError::Unrecognized(0)) => break,
+                    Err(ReadError::NoData) => break,
                     x => panic!("received unexpected value '{:?}'", x),
                 }
 
-                let msgid = cr.read_value().unwrap().uint() as u32;
-                let method = cr.read_value().unwrap().string();
-                let params = cr.read_value().unwrap().array();
-                let mut sw = sw.clone();
+                let msgid = reader.read_value().unwrap().uint() as u32;
+                let method = reader.read_value().unwrap().string();
+                let params = reader.read_value().unwrap().array();
+                let sw = sw.clone();
 
-                Thread::spawn(move || {
+                thread::spawn(move || {
                     let msgid = msgid;
                     let method = method;
                     let mut params = params;
+                    let mut writer = ::test::ChanWriter(sw);
 
                     macro_rules! echo(() => ({
-                        write(&mut sw, 1 as i8).unwrap();
-                        write_value(&mut sw, Value::Uint32(msgid)).unwrap();
-                        write(&mut sw, ()).unwrap(); // error
-                        write_value(&mut sw, params.swap_remove(0)).unwrap(); // value
+                        write(&mut writer, 1 as i8).unwrap();
+                        write_value(&mut writer, Value::Uint32(msgid)).unwrap();
+                        write(&mut writer, ()).unwrap(); // error
+                        write_value(&mut writer, params.swap_remove(0)).unwrap(); // value
                     }));
 
                     match method.as_slice() {
@@ -221,6 +218,7 @@ mod test {
                             echo!();
                         },
                         "slow_echo" => {
+                            use std::old_io::timer::sleep;
                             sleep(Duration::seconds(2));
                             echo!();
                         },
@@ -230,7 +228,7 @@ mod test {
             }
         });
 
-        let mut client = Client::new(ChanReader::new(sr), ChanWriter::new(cw));
+        let mut client = Client::new(::test::ChanReader(sr), ::test::ChanWriter(cw));
 
         let mut hello_future = client.call("slow_echo".to_string(), vec![Value::String("hello".to_string())]).unwrap();
         let mut world_future = client.call("quick_echo".to_string(), vec![Value::String("world".to_string())]).unwrap();

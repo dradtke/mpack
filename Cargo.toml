@@ -10,3 +10,5 @@ documentation = "http://rust-ci.org/dradtke/mpack/doc/mpack/"
 keywords = ["msgpack", "MessagePack", "rpc"]
 license = "MIT"
 
+[dependencies]
+rand = "0.2.0"

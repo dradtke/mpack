@@ -9,7 +9,7 @@
 //! Better serialization sugar is planned, but for now, here's how you
 //! would open up a connection and send a value to it:
 //!
-//! ~~~
+//! ~~~ignore
 //! use std::net::TcpStream;
 //! use mpack::{Value, write_value};
 //!
@@ -22,18 +22,19 @@
 //!
 //! Reading values is just as easy:
 //!
-//! ~~~
+//! ~~~ignore
 //! use std::net::TcpStream;
-//! use mpack::{Value, read_value};
+//! use mpack::{Value, Reader};
 //!
 //! let mut conn = TcpStream::connect("127.0.0.1:8081").unwrap();
+//! let mut reader = Reader::new(conn);
 //!
-//! match read_value(&mut conn).unwrap() {
+//! match reader.read_value().unwrap() {
 //!     Value::Int32(x) => assert_eq!(x, 3),
 //!     _ => panic!("received unexpected value"),
 //! }
 //!
-//! match read_value(&mut conn).unwrap() {
+//! match reader.read_value().unwrap() {
 //!     Value::String(str) => println!("{}", str),
 //!     _ => panic!("received unexpected value"),
 //! }
@@ -212,14 +213,30 @@ impl<R: Read + Send> Reader<R> {
         // of std::old_io::Reader::read_be_uint_n, but ends up being slightly more efficient because
         // it will store the result in the correctly-sized value rather than shove everything
         // into a u64.
-        macro_rules! read_be(
+        macro_rules! read_be_int(
             ($src:expr, $int:ident) => ({
                 let mut val: $int = 0;
                 for (i, next) in $src.by_ref().take(std::$int::BYTES as u64).bytes().enumerate() {
                     val += (try!(next) as $int) << (std::$int::BYTES - ((i + 1) as u32)) * 8;
                 }
-                Ok::<$int, ReadError>(val)
+                val
             })
+        );
+
+        // Reads a big-endian float from the provided reader. Floats are trickier because they need
+        // to be kept in raw-byte form and transmuted to the proper type, and there's no automatic
+        // way to determine the size of the data type, so that needs to be passed in manually.
+        macro_rules! read_be_float(
+            ($src:expr, $f:ident, $s:expr) => ({
+                let mut bytes: [u8; $s] = [0; $s];
+                for (i, next) in $src.by_ref().take($s).bytes().enumerate() {
+                    bytes[i] = try!(next);
+                }
+                if cfg!(target_endian = "little") {
+                    bytes.reverse();
+                }
+                unsafe { std::mem::transmute::<[u8; $s], $f>(bytes) }
+            });
         );
 
         // Reads an exact number of bytes from the provided reader.
@@ -239,18 +256,18 @@ impl<R: Read + Send> Reader<R> {
             byte::FALSE => Ok(Boolean(false)),
             byte::TRUE => Ok(Boolean(true)),
 
-            byte::U8 => Ok(Uint8(try!(read_be!(self.reader, u8)))),
-            byte::U16 => Ok(Uint16(try!(read_be!(self.reader, u16)))),
-            byte::U32 => Ok(Uint32(try!(read_be!(self.reader, u32)))),
-            byte::U64 => Ok(Uint64(try!(read_be!(self.reader, u64)))),
+            byte::U8 => Ok(Uint8(read_be_int!(self.reader, u8))),
+            byte::U16 => Ok(Uint16(read_be_int!(self.reader, u16))),
+            byte::U32 => Ok(Uint32(read_be_int!(self.reader, u32))),
+            byte::U64 => Ok(Uint64(read_be_int!(self.reader, u64))),
 
-            byte::I8 => Ok(Int8(try!(read_be!(self.reader, i8)))),
-            byte::I16 => Ok(Int16(try!(read_be!(self.reader, i16)))),
-            byte::I32 => Ok(Int32(try!(read_be!(self.reader, i32)))),
-            byte::I64 => Ok(Int64(try!(read_be!(self.reader, i64)))),
+            byte::I8 => Ok(Int8(read_be_int!(self.reader, i8))),
+            byte::I16 => Ok(Int16(read_be_int!(self.reader, i16))),
+            byte::I32 => Ok(Int32(read_be_int!(self.reader, i32))),
+            byte::I64 => Ok(Int64(read_be_int!(self.reader, i64))),
 
-            byte::F32 => Ok(Float32(try!(read_be!(self.reader, u32)) as f32)),
-            byte::F64 => Ok(Float64(try!(read_be!(self.reader, u64)) as f64)),
+            byte::F32 => Ok(Float32(read_be_float!(self.reader, f32, 4))),
+            byte::F64 => Ok(Float64(read_be_float!(self.reader, f64, 8))),
 
             b if (b >> 5) == 0b00000101 => {
                 let n = (b & 0b00011111) as usize;
@@ -261,7 +278,7 @@ impl<R: Read + Send> Reader<R> {
             },
 
             byte::STR8 => {
-                let n = try!(read_be!(self.reader, u8)) as usize;
+                let n = read_be_int!(self.reader, u8) as usize;
                 match string::String::from_utf8(read_exact!(self.reader, n)) {
                     Ok(s) => Ok(String(s)),
                     Err(_) => panic!("received invalid utf-8"),
@@ -269,7 +286,7 @@ impl<R: Read + Send> Reader<R> {
             },
 
             byte::STR16 => {
-                let n = try!(read_be!(self.reader, u16)) as usize;
+                let n = read_be_int!(self.reader, u16) as usize;
                 match string::String::from_utf8(read_exact!(self.reader, n)) {
                     Ok(s) => Ok(String(s)),
                     Err(_) => panic!("received invalid utf-8"),
@@ -277,7 +294,7 @@ impl<R: Read + Send> Reader<R> {
             },
 
             byte::STR32 => {
-                let n = try!(read_be!(self.reader, u32)) as usize;
+                let n = read_be_int!(self.reader, u32) as usize;
                 match string::String::from_utf8(read_exact!(self.reader, n)) {
                     Ok(s) => Ok(String(s)),
                     Err(_) => panic!("received invalid utf-8"),
@@ -285,17 +302,17 @@ impl<R: Read + Send> Reader<R> {
             },
 
             byte::BIN8 => {
-                let n = try!(read_be!(self.reader, u8)) as usize;
+                let n = read_be_int!(self.reader, u8) as usize;
                 Ok(Binary(read_exact!(self.reader, n)))
             },
 
             byte::BIN16 => {
-                let n = try!(read_be!(self.reader, u16)) as usize;
+                let n = read_be_int!(self.reader, u16) as usize;
                 Ok(Binary(read_exact!(self.reader, n)))
             },
 
             byte::BIN32 => {
-                let n = try!(read_be!(self.reader, u32)) as usize;
+                let n = read_be_int!(self.reader, u32) as usize;
                 Ok(Binary(read_exact!(self.reader, n)))
             },
 
@@ -309,7 +326,7 @@ impl<R: Read + Send> Reader<R> {
             },
 
             byte::AR16 => {
-                let n = try!(read_be!(self.reader, u16)) as usize;
+                let n = read_be_int!(self.reader, u16) as usize;
                 let mut ar = Vec::with_capacity(n);
                 for _ in range(0, n) {
                     ar.push(try!(self.read_value()));
@@ -318,7 +335,7 @@ impl<R: Read + Send> Reader<R> {
             },
 
             byte::AR32 => {
-                let n = try!(read_be!(self.reader, u32)) as usize;
+                let n = read_be_int!(self.reader, u32) as usize;
                 let mut ar = Vec::with_capacity(n);
                 for _ in range(0, n) {
                     ar.push(try!(self.read_value()));
@@ -336,7 +353,7 @@ impl<R: Read + Send> Reader<R> {
             },
 
             byte::MAP16 => {
-                let n = try!(read_be!(self.reader, u16)) as usize;
+                let n = read_be_int!(self.reader, u16) as usize;
                 let mut m = Vec::with_capacity(n);
                 for _ in range(0, n) {
                     m.push((try!(self.read_value()), try!(self.read_value())));
@@ -345,7 +362,7 @@ impl<R: Read + Send> Reader<R> {
             },
 
             byte::MAP32 => {
-                let n = try!(read_be!(self.reader, u32)) as usize;
+                let n = read_be_int!(self.reader, u32) as usize;
                 let mut m = Vec::with_capacity(n);
                 for _ in range(0, n) {
                     m.push((try!(self.read_value()), try!(self.read_value())));
@@ -354,25 +371,25 @@ impl<R: Read + Send> Reader<R> {
             },
 
             // Extension types.
-            byte::FIXEXT1 => Ok(Extended(try!(read_be!(self.reader, i8)), read_exact!(self.reader, 1))),
-            byte::FIXEXT2 => Ok(Extended(try!(read_be!(self.reader, i8)), read_exact!(self.reader, 2))),
-            byte::FIXEXT4 => Ok(Extended(try!(read_be!(self.reader, i8)), read_exact!(self.reader, 4))),
-            byte::FIXEXT8 => Ok(Extended(try!(read_be!(self.reader, i8)), read_exact!(self.reader, 8))),
-            byte::FIXEXT16 => Ok(Extended(try!(read_be!(self.reader, i8)), read_exact!(self.reader, 16))),
+            byte::FIXEXT1 => Ok(Extended(read_be_int!(self.reader, i8), read_exact!(self.reader, 1))),
+            byte::FIXEXT2 => Ok(Extended(read_be_int!(self.reader, i8), read_exact!(self.reader, 2))),
+            byte::FIXEXT4 => Ok(Extended(read_be_int!(self.reader, i8), read_exact!(self.reader, 4))),
+            byte::FIXEXT8 => Ok(Extended(read_be_int!(self.reader, i8), read_exact!(self.reader, 8))),
+            byte::FIXEXT16 => Ok(Extended(read_be_int!(self.reader, i8), read_exact!(self.reader, 16))),
 
             byte::EXT8 => {
-                let n = try!(read_be!(self.reader, u8)) as usize;
-                Ok(Extended(try!(read_be!(self.reader, i8)), read_exact!(self.reader, n)))
+                let n = read_be_int!(self.reader, u8) as usize;
+                Ok(Extended(read_be_int!(self.reader, i8), read_exact!(self.reader, n)))
             },
 
             byte::EXT16 => {
-                let n = try!(read_be!(self.reader, u16)) as usize;
-                Ok(Extended(try!(read_be!(self.reader, i8)), read_exact!(self.reader, n)))
+                let n = read_be_int!(self.reader, u16) as usize;
+                Ok(Extended(read_be_int!(self.reader, i8), read_exact!(self.reader, n)))
             },
 
             byte::EXT32 => {
-                let n = try!(read_be!(self.reader, u32)) as usize;
-                Ok(Extended(try!(read_be!(self.reader, i8)), read_exact!(self.reader, n)))
+                let n = read_be_int!(self.reader, u32) as usize;
+                Ok(Extended(read_be_int!(self.reader, i8), read_exact!(self.reader, n)))
             },
 
             x => {
@@ -415,11 +432,22 @@ pub fn write_value<W: Write>(dest: &mut W, val: Value) -> Result<(), WriteError>
     use Value::*;
     use std::mem::transmute;
 
-    // Convert a number to its big-endian byte representation.
-    macro_rules! b(
+    // Convert an integer to its big-endian byte representation.
+    macro_rules! be_int(
         ($x:expr, $n:ident) => ({
             use std::num::Int;
             unsafe { transmute::<_, [u8; std::$n::BYTES as usize]>(($x as $n).to_be()) }
+        })
+    );
+
+    // Convert a float to its big-endian byte representation.
+    macro_rules! be_float(
+        ($x:expr, $f:ident, $s:expr) => ({
+            let mut bytes = unsafe { transmute::<$f, [u8; $s]>($x) };
+            if cfg!(target_endian = "little") {
+                bytes.reverse();
+            }
+            bytes
         })
     );
 
@@ -438,26 +466,26 @@ pub fn write_value<W: Write>(dest: &mut W, val: Value) -> Result<(), WriteError>
         Boolean(true) => try!(dest.write_all(&[byte::TRUE])),
 
         Uint8(x) => try!(dest.write_all(&[byte::U8, x])),
-        Uint16(x) => try!(dest.write_all(data![byte::U16; b!(x, u16)])),
-        Uint32(x) => try!(dest.write_all(data![byte::U32; b!(x, u32)])),
-        Uint64(x) => try!(dest.write_all(data![byte::U64; b!(x, u64)])),
+        Uint16(x) => try!(dest.write_all(data![byte::U16; be_int!(x, u16)])),
+        Uint32(x) => try!(dest.write_all(data![byte::U32; be_int!(x, u32)])),
+        Uint64(x) => try!(dest.write_all(data![byte::U64; be_int!(x, u64)])),
 
         Int8(x) => try!(dest.write_all(&[byte::I8, x as u8])),
-        Int16(x) => try!(dest.write_all(data![byte::I16; b!(x, i16)])),
-        Int32(x) => try!(dest.write_all(data![byte::I32; b!(x, i32)])),
-        Int64(x) => try!(dest.write_all(data![byte::I64; b!(x, i64)])),
+        Int16(x) => try!(dest.write_all(data![byte::I16; be_int!(x, i16)])),
+        Int32(x) => try!(dest.write_all(data![byte::I32; be_int!(x, i32)])),
+        Int64(x) => try!(dest.write_all(data![byte::I64; be_int!(x, i64)])),
 
-        Float32(x) => try!(dest.write_all(data![byte::F32; b!(x, u32)])),
-        Float64(x) => try!(dest.write_all(data![byte::F64; b!(x, u64)])),
+        Float32(x) => try!(dest.write_all(data![byte::F32; be_float!(x, f32, 4)])),
+        Float64(x) => try!(dest.write_all(data![byte::F64; be_float!(x, f64, 8)])),
 
         String(s) => {
             let bytes = s.as_bytes();
             let n = bytes.len();
             try!(match n {
-                0...31 => Ok(try!(dest.write_all(&[(0b10100000 | n) as u8]))), // fixstr
-                32...255 => Ok(try!(dest.write_all(&[byte::STR8, n as u8]))), // str 8
-                256...65535 => Ok(try!(dest.write_all(data![byte::STR16; b!(n, u16), bytes]))), // str 16
-                65536...4294967295 => Ok(try!(dest.write_all(data![byte::STR32; b!(n, u32), bytes]))), // str 32
+                0...31 => Ok(try!(dest.write_all(data![(0b10100000 | n) as u8; bytes]))), // fixstr
+                32...255 => Ok(try!(dest.write_all(data![byte::STR8; [n as u8], bytes]))), // str 8
+                256...65535 => Ok(try!(dest.write_all(data![byte::STR16; be_int!(n, u16), bytes]))), // str 16
+                65536...4294967295 => Ok(try!(dest.write_all(data![byte::STR32; be_int!(n, u32), bytes]))), // str 32
                 _ => Err(WriteError::TooMuchData(n)),
             });
         },
@@ -465,9 +493,9 @@ pub fn write_value<W: Write>(dest: &mut W, val: Value) -> Result<(), WriteError>
         Binary(b) => {
             let n = b.len();
             try!(match n {
-                0...255 => Ok(try!(dest.write_all(data![byte::BIN8; b!(n, u8), b.as_slice()]))), // bin 8
-                256...65535 => Ok(try!(dest.write_all(data![byte::BIN16; b!(n, u16), b.as_slice()]))), // bin 16
-                65536...4294967295 => Ok(try!(dest.write_all(data![byte::BIN32; b!(n, u32), b.as_slice()]))), // bin 32
+                0...255 => Ok(try!(dest.write_all(data![byte::BIN8; be_int!(n, u8), b.as_slice()]))), // bin 8
+                256...65535 => Ok(try!(dest.write_all(data![byte::BIN16; be_int!(n, u16), b.as_slice()]))), // bin 16
+                65536...4294967295 => Ok(try!(dest.write_all(data![byte::BIN32; be_int!(n, u32), b.as_slice()]))), // bin 32
                 _ => Err(WriteError::TooMuchData(n)),
             });
         },
@@ -476,8 +504,8 @@ pub fn write_value<W: Write>(dest: &mut W, val: Value) -> Result<(), WriteError>
             let n = values.len();
             try!(match n {
                 0...15 => Ok(try!(dest.write_all(&[(0b10010000 | n) as u8]))), // fixarray
-                16...65535 => Ok(try!(dest.write_all(data![byte::AR16; b!(n, u16)]))), // 16 array
-                65536...4294967295 => Ok(try!(dest.write_all(data![byte::AR32; b!(n, u32)]))), // 32 array
+                16...65535 => Ok(try!(dest.write_all(data![byte::AR16; be_int!(n, u16)]))), // 16 array
+                65536...4294967295 => Ok(try!(dest.write_all(data![byte::AR32; be_int!(n, u32)]))), // 32 array
                 _ => Err(WriteError::TooMuchData(n)),
             });
             for v in values.into_iter() {
@@ -489,8 +517,8 @@ pub fn write_value<W: Write>(dest: &mut W, val: Value) -> Result<(), WriteError>
             let n = entries.len();
             try!(match n {
                 0...15 => Ok(try!(dest.write_all(&[(0b10000000 | n) as u8]))), // fixmap
-                16...65535 => Ok(try!(dest.write_all(data![byte::MAP16; b!(n, u16)]))), // 16 map
-                65536...4294967295 => Ok(try!(dest.write_all(data![byte::MAP32; b!(n, u32)]))), // 32 map
+                16...65535 => Ok(try!(dest.write_all(data![byte::MAP16; be_int!(n, u16)]))), // 16 map
+                65536...4294967295 => Ok(try!(dest.write_all(data![byte::MAP32; be_int!(n, u32)]))), // 32 map
                 _ => Err(WriteError::TooMuchData(n)),
             });
             for (k, v) in entries.into_iter() {
@@ -508,8 +536,8 @@ pub fn write_value<W: Write>(dest: &mut W, val: Value) -> Result<(), WriteError>
                 8 => Ok(try!(dest.write_all(&[byte::FIXEXT8]))),
                 16 => Ok(try!(dest.write_all(&[byte::FIXEXT16]))),
                 0...255 => Ok(try!(dest.write_all(&[byte::EXT8, n as u8]))), // ext 8
-                256...65535 => Ok(try!(dest.write_all(data![byte::MAP16; b!(n, u16)]))), // ext 16
-                65536...4294967295 => Ok(try!(dest.write_all(data![byte::MAP32; b!(n, u32)]))), // ext 32
+                256...65535 => Ok(try!(dest.write_all(data![byte::MAP16; be_int!(n, u16)]))), // ext 16
+                65536...4294967295 => Ok(try!(dest.write_all(data![byte::MAP32; be_int!(n, u32)]))), // ext 32
                 _ => Err(WriteError::TooMuchData(n)),
             });
             try!(dest.write_all(&[id as u8]));
@@ -595,19 +623,57 @@ impl FromError<io::Error> for ReadError {
 mod test {
     extern crate rand;
 
-    use std::old_io::{ChanReader, ChanWriter};
-    use std::sync::mpsc::channel;
+    use std::io::{self, Read, Write};
+    use std::sync::mpsc::{channel, Sender, Receiver};
     use std::string;
     use self::rand::{Rng, StdRng};
     use super::{IntoValue, write_value};
+
+    pub struct ChanReader(pub Receiver<u8>);
+
+    impl Read for ChanReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            for i in range(0, buf.len()) {
+                match self.0.recv() {
+                    Ok(byte) => buf[i] = byte,
+                    Err(..) => return Ok(i),
+                }
+            }
+            Ok(buf.len())
+        }
+    }
+
+    pub struct ChanWriter(pub Sender<u8>);
+
+    impl Write for ChanWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.len() == 0 {
+                Ok(0)
+            } else {
+                self.0.send(buf[0]);
+                Ok(1)
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            for byte in buf.iter() {
+                self.0.send(*byte);
+            }
+            Ok(())
+        }
+    }
 
     const LETTERS: &'static [char] = &['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'];
 
     fn test<T: IntoValue>(arg: T) {
         let val = arg.into_value();
         let (tx, rx) = channel();
-        write_value(&mut ChanWriter::new(tx), val.clone()).unwrap();
-        assert_eq!(super::Reader::new(&mut ChanReader::new(rx)).read_value().unwrap(), val);
+        write_value(&mut ChanWriter(tx), val.clone()).unwrap();
+        assert_eq!(super::Reader::new(&mut ChanReader(rx)).read_value().unwrap(), val);
     }
 
     fn random_string(n: usize) -> string::String {
