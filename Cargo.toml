@@ -9,3 +9,4 @@ repository = "https://github.com/dradtke/mpack.git"
 documentation = "http://rust-ci.org/dradtke/mpack/doc/mpack/"
 keywords = ["msgpack", "MessagePack", "rpc"]
 license = "MIT"
+

@@ -1,71 +1,80 @@
 use std::collections::HashMap;
-use std::old_io::{IoErrorKind, IoResult, Stream};
+use std::io::{self, Read, Write};
+use std::marker::PhantomData;
 use std::string::String;
 use std::sync::{Arc, Future, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
 use std::sync::mpsc::{channel, Sender, Receiver};
-use std::thread::Thread;
+use std::thread::{self, JoinGuard};
 
-use super::{Value, read_value, write, write_value};
+use super::{Value, ReadError, WriteError, write, write_value};
 
 static MSGID: AtomicUsize = ATOMIC_USIZE_INIT;
 
 pub type RpcResult = Result<Value, Value>;
+type PendingData = Arc<Mutex<HashMap<u32, Sender<RpcResult>>>>;
 
 /// `Client` represents a connection to some server that accepts
 /// MessagePack RPC requests.
-pub struct Client<R, W> {
+pub struct Client<'c, R, W> {
+    input: PhantomData<R>, // the reader instance is owned by the dispatch thread
     output: W,
-    pending: Arc<Mutex<HashMap<u32, Sender<RpcResult>>>>,
+    pending: PendingData,
+    dispatch_guard: JoinGuard<'c, ()>,
 }
 
-impl<R, W> Client<R, W> where R: Reader + Send, W: Writer + Send {
+impl<'c, R, W> Client<'c, R, W> where R: Read + Send + 'c, W: Write + Send + 'c {
     /// Construct a new Client instance from a stream.
     ///
     /// In order for this to work properly, the stream's `.clone()` method must
     /// return a new handle to the shared underlying stream; in other words, it
     /// must be a shallow clone and not deep. `TCPStream` and `UnixStream` are known
     /// to do this, but other types should be aware of this restriction.
-    pub fn new_for_stream<S>(stream: S) -> Client<S, S> where S: Stream + Clone + Send {
+    pub fn new_for_stream<S>(stream: S) -> Client<'c, S, S> where S: Read + Write + Clone + Send + 'c {
         Client::new(stream.clone(), stream)
     }
 
     /// Construct a new Client instance from a reader/writer pair.
-    pub fn new(mut reader: R, writer: W) -> Client<R, W> {
+    pub fn new(reader: R, writer: W) -> Client<'c, R, W> {
         let pending = Arc::new(Mutex::new(HashMap::new()));
-
-        {
-            let pending = pending.clone();
-            Thread::spawn(move || {
-                loop {
-                    match read_value(&mut reader) {
-                        Ok(value) => assert_eq!(value.int(), 1),
-                        Err(super::ReadError::Unrecognized(0)) => break, // kill signal
-                        Err(super::ReadError::Io(ref e)) if e.kind == IoErrorKind::EndOfFile => break,
-                        Err(e) => panic!("error: {}", e),
-                    }
-
-                    match read_value(&mut reader) {
-                        Ok(Value::Uint32(msgid)) => {
-                            let responder: Sender<RpcResult> = pending.lock().unwrap().remove(&msgid).unwrap();
-
-                            let err = read_value(&mut reader).unwrap();
-                            let res = read_value(&mut reader).unwrap();
-
-                            responder.send(if err == Value::Nil { Ok(res) } else { Err(err) }).unwrap();
-                        },
-                        Ok(value) => panic!("received value, but it wasn't a u32: {:?}", value),
-                        Err(e) => panic!("failed to receive value: {:?}", e),
-                    }
-                }
-            });
+        Client{
+            input: PhantomData,
+            output: writer,
+            pending: pending.clone(),
+            dispatch_guard: Client::<R, W>::dispatch_thread(reader, pending),
         }
+    }
 
-        Client { output: writer, pending: pending }
+    /// Runs a scoped thread for dispatching messages received from reader to the appropriate parties.
+    fn dispatch_thread(reader: R, pending: PendingData) -> JoinGuard<'c, ()> {
+        thread::scoped(move || {
+            let mut reader = super::Reader::new(reader);
+            loop {
+                match reader.read_value() {
+                    Ok(value) => assert_eq!(value.int(), 1),
+                    Err(ReadError::Unrecognized(0)) => break, // kill signal
+                    Err(ReadError::NoData) => break, // eof
+                    Err(e) => panic!("error: {}", e),
+                }
+
+                match reader.read_value() {
+                    Ok(Value::Uint32(msgid)) => {
+                        let responder: Sender<RpcResult> = pending.lock().unwrap().remove(&msgid).unwrap();
+
+                        let err = reader.read_value().unwrap();
+                        let res = reader.read_value().unwrap();
+
+                        responder.send(if err == Value::Nil { Ok(res) } else { Err(err) }).unwrap();
+                    },
+                    Ok(value) => panic!("received value, but it wasn't a u32: {:?}", value),
+                    Err(e) => panic!("failed to receive value: {:?}", e),
+                }
+            }
+        })
     }
 
     /// Helper for calling methods via RPC.
-    fn do_call(&mut self, method: String, params: Vec<Value>) -> IoResult<Receiver<RpcResult>> {
+    fn do_call(&mut self, method: String, params: Vec<Value>) -> Result<Receiver<RpcResult>, WriteError> {
         try!(write_value(&mut self.output, Value::Int8(0))); // for method call
 
         let msgid = MSGID.fetch_add(1, Ordering::SeqCst) as u32;
@@ -85,7 +94,7 @@ impl<R, W> Client<R, W> where R: Reader + Send, W: Writer + Send {
     /// If an `Err` value is returned, it indicates some IO error that occurred while trying
     /// to make the call. An `Ok` value means that the call was successfully made. Calling
     /// `.get()` on its contents will block the thread until a response is received.
-    pub fn call(&mut self, method: String, params: Vec<Value>) -> IoResult<Future<RpcResult>> {
+    pub fn call(&mut self, method: String, params: Vec<Value>) -> Result<Future<RpcResult>, WriteError> {
         Ok(Future::from_receiver(try!(self.do_call(method, params))))
     }
 
@@ -100,9 +109,9 @@ impl<R, W> Client<R, W> where R: Reader + Send, W: Writer + Send {
     ///
     /// The new thread could conceivably panic if the Client instance gets cleaned up before
     /// the callback is invoked.
-    pub fn call_cb<F: FnOnce(RpcResult) -> () + Send>(&mut self, method: String, params: Vec<Value>, f: F) -> IoResult<()> {
+    pub fn call_cb<F: FnOnce(RpcResult) -> () + Send + 'static>(&mut self, method: String, params: Vec<Value>, f: F) -> Result<(), WriteError> {
         let listener = try!(self.do_call(method, params));
-        Thread::spawn(move || {
+        thread::spawn(move || {
             f(listener.recv().unwrap());
         });
         Ok(())
@@ -112,17 +121,17 @@ impl<R, W> Client<R, W> where R: Reader + Send, W: Writer + Send {
     ///
     /// If an `Err` value is returned, it indicates some IO error that occurred while trying
     /// to make the call. An `Ok` value will contain the server's response.
-    pub fn call_sync(&mut self, method: String, params: Vec<Value>) -> IoResult<RpcResult> {
+    pub fn call_sync(&mut self, method: String, params: Vec<Value>) -> Result<RpcResult, WriteError> {
         Ok(try!(self.do_call(method, params)).recv().unwrap())
     }
 }
 
 #[unsafe_destructor]
-impl<R, W> Drop for Client<R, W> where W: Writer {
+impl<'c, R, W> Drop for Client<'c, R, W> where W: Write {
     fn drop(&mut self) {
-        match self.output.write_u8(0) {
+        match self.output.write(&[0]) {
             Ok(_) => (),
-            Err(ref e) if e.kind == IoErrorKind::BrokenPipe => (), // already closed, no need to kill it
+            Err(ref e) if e.kind() == io::ErrorKind::BrokenPipe => (), // already closed, no need to kill it
             Err(e) => panic!("{}", e),
         }
     }
@@ -136,7 +145,7 @@ mod test {
     use std::thread::Thread;
     use std::time::duration::Duration;
     use super::Client;
-    use super::super::{Value, ReadError, read_value, write, write_value};
+    use super::super::{Value, ReadError, write, write_value};
 
     /// This test just calls a method "ping" and expects the result "pong".
     #[test] fn simple_test() {
@@ -147,10 +156,10 @@ mod test {
             let mut cr = ChanReader::new(cr);
             let mut sw = ChanWriter::new(sw);
 
-            assert_eq!(read_value(&mut cr).unwrap().int(), 0);
-            let msgid = read_value(&mut cr).unwrap().uint() as u32;
-            let method = read_value(&mut cr).unwrap().string();
-            let _ = read_value(&mut cr).unwrap().array(); // params
+            assert_eq!(cr.read_value().unwrap().int(), 0);
+            let msgid = cr.read_value().unwrap().uint() as u32;
+            let method = cr.read_value().unwrap().string();
+            let _ = cr.read_value().unwrap().array(); // params
 
             match method.as_slice() {
                 "ping" => {
@@ -183,16 +192,16 @@ mod test {
             let sw = ChanWriter::new(sw);
 
             loop {
-                match read_value(&mut cr) {
+                match cr.read_value() {
                     Ok(value) => assert_eq!(value.int(), 0),
                     Err(ReadError::Io(ref e)) if e.kind == IoErrorKind::EndOfFile => break,
                     Err(ReadError::Unrecognized(0)) => break,
                     x => panic!("received unexpected value '{:?}'", x),
                 }
 
-                let msgid = read_value(&mut cr).unwrap().uint() as u32;
-                let method = read_value(&mut cr).unwrap().string();
-                let params = read_value(&mut cr).unwrap().array();
+                let msgid = cr.read_value().unwrap().uint() as u32;
+                let method = cr.read_value().unwrap().string();
+                let params = cr.read_value().unwrap().array();
                 let mut sw = sw.clone();
 
                 Thread::spawn(move || {
