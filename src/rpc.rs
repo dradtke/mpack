@@ -28,13 +28,17 @@ impl<'c, R, W> Client<'c, R, W> where R: Read + Send + 'c, W: Write + Send + 'c 
     ///
     /// In order for this to work properly, the stream's `.clone()` method must
     /// return a new handle to the shared underlying stream; in other words, it
-    /// must be a shallow clone and not deep. `TCPStream` and `UnixStream` are known
+    /// must be a shallow clone and not deep. `TcpStream` and `UnixStream` are known
     /// to do this, but other types should be aware of this restriction.
     pub fn new_for_stream<S>(stream: S) -> Client<'c, S, S> where S: Read + Write + Clone + Send + 'c {
         Client::new(stream.clone(), stream)
     }
 
-    /// Construct a new Client instance from a reader/writer pair.
+    /// Construct a new Client instance.
+    ///
+    /// This will spawn a scoped dispatch thread which will take ownership of the `Read`
+    /// instance, and which will exit when it detects EOF, or when it receives a 0 in lieu
+    /// of a MessagePack data type identifier.
     pub fn new(reader: R, writer: W) -> Client<'c, R, W> {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         Client{
