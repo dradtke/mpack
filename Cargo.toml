@@ -1,12 +1,12 @@
 [package]
 
 name = "mpack"
-version = "0.0.4"
+version = "0.0.5"
 authors = ["Damien Radtke"]
 
-description = "A new MessagePack implementation for Rust."
+description = "An alternative MessagePack implementation for Rust."
 repository = "https://github.com/dradtke/mpack.git"
-documentation = "http://rust-ci.org/dradtke/mpack/doc/mpack/"
+documentation = "http://www.rustdox.com/dradtke/mpack/mpack/"
 keywords = ["msgpack", "MessagePack", "rpc"]
 license = "MIT"
 
