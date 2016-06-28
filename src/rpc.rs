@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::marker::PhantomData;
 use std::string::String;
-use std::sync::{Arc, Future, Mutex};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
 use std::sync::mpsc::{channel, Sender, Receiver};
-use std::thread::{self, JoinGuard};
+use std::thread::{self, JoinHandle};
 
 use super::{Value, ReadError, WriteError, write, write_value};
 
@@ -16,21 +16,21 @@ type PendingData = Arc<Mutex<HashMap<u32, Sender<RpcResult>>>>;
 
 /// `Client` represents a connection to some server that accepts
 /// MessagePack RPC requests.
-pub struct Client<'c, R, W> {
-    input: PhantomData<R>, // the reader instance is owned by the dispatch thread
+pub struct Client<R: Read + Send + 'static, W: Write + Send> {
+    input: PhantomData<R>, // the reader instance is effectively owned by the dispatch thread
     output: W,
     pending: PendingData,
-    dispatch_guard: JoinGuard<'c, ()>,
+    dispatch_join_handle: JoinHandle<()>,
 }
 
-impl<'c, R, W> Client<'c, R, W> where R: Read + Send + 'c, W: Write + Send + 'c {
+impl<R, W> Client<R, W> where R: Read + Send + 'static, W: Write + Send {
     /// Construct a new Client instance from a stream.
     ///
     /// In order for this to work properly, the stream's `.clone()` method must
     /// return a new handle to the shared underlying stream; in other words, it
     /// must be a shallow clone and not deep. `TcpStream` and `UnixStream` are known
     /// to do this, but other types should be aware of this restriction.
-    pub fn new_for_stream<S>(stream: S) -> Client<'c, S, S> where S: Read + Write + Clone + Send + 'c {
+    pub fn new_for_stream<S>(stream: S) -> Client<S, S> where S: Read + Write + Clone + Send + 'static {
         Client::new(stream.clone(), stream)
     }
 
@@ -39,20 +39,21 @@ impl<'c, R, W> Client<'c, R, W> where R: Read + Send + 'c, W: Write + Send + 'c 
     /// This will spawn a scoped dispatch thread which will take ownership of the `Read`
     /// instance, and which will exit when it detects EOF, or when it receives a 0 in lieu
     /// of a MessagePack data type identifier.
-    pub fn new(reader: R, writer: W) -> Client<'c, R, W> {
+    pub fn new(reader: R, writer: W) -> Client<R, W> {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         Client{
             input: PhantomData,
             output: writer,
             pending: pending.clone(),
-            dispatch_guard: Client::<R, W>::dispatch_thread(reader, pending),
+            dispatch_join_handle: Client::<R, W>::dispatch_thread(reader, pending),
         }
     }
 
     /// Runs a scoped thread for dispatching messages received from reader to the appropriate parties.
-    fn dispatch_thread(reader: R, pending: PendingData) -> JoinGuard<'c, ()> {
-        thread::scoped(move || {
-            let mut reader = super::Reader::new(reader);
+    fn dispatch_thread(reader: R, pending: PendingData) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let r = reader;
+            let mut reader = super::Reader::new(r);
             loop {
                 match reader.read_value() {
                     Ok(value) => assert_eq!(value.int(), 1),
@@ -93,13 +94,13 @@ impl<'c, R, W> Client<'c, R, W> where R: Read + Send + 'c, W: Write + Send + 'c 
         Ok(listener)
     }
 
-    /// Call a method via RPC and receive the response as a Future.
+    /// Call a method via RPC and receive the response as a Receiver.
     ///
     /// If an `Err` value is returned, it indicates some IO error that occurred while trying
     /// to make the call. An `Ok` value means that the call was successfully made. Calling
     /// `.get()` on its contents will block the thread until a response is received.
-    pub fn call(&mut self, method: String, params: Vec<Value>) -> Result<Future<RpcResult>, WriteError> {
-        Ok(Future::from_receiver(try!(self.do_call(method, params))))
+    pub fn call(&mut self, method: String, params: Vec<Value>) -> Result<Receiver<RpcResult>, WriteError> {
+        Ok(try!(self.do_call(method, params)))
     }
 
     /// Call a method via RPC and receive the response in a closure.
@@ -130,8 +131,7 @@ impl<'c, R, W> Client<'c, R, W> where R: Read + Send + 'c, W: Write + Send + 'c 
     }
 }
 
-#[unsafe_destructor]
-impl<'c, R, W> Drop for Client<'c, R, W> where W: Write {
+impl<R, W> Drop for Client<R, W> where R: Read + Send + 'static, W: Write + Send {
     fn drop(&mut self) {
         match self.output.write(&[0]) {
             Ok(_) => (),
@@ -145,7 +145,7 @@ impl<'c, R, W> Drop for Client<'c, R, W> where W: Write {
 mod test {
     use std::sync::mpsc::channel;
     use std::thread;
-    use std::time::duration::Duration;
+    use std::time::Duration;
 
     use super::Client;
     use super::super::{Value, ReadError, write, write_value};
@@ -164,7 +164,7 @@ mod test {
             let method = reader.read_value().unwrap().string();
             let _ = reader.read_value().unwrap().array(); // params
 
-            match method.as_slice() {
+            match method.as_str() {
                 "ping" => {
                     write(&mut writer, 1 as i8).unwrap();
                     write_value(&mut writer, Value::Uint32(msgid)).unwrap();
@@ -176,8 +176,7 @@ mod test {
         });
 
         let mut client = Client::new(::test::ChanReader(sr), ::test::ChanWriter(cw));
-        let mut value_future = client.call("ping".to_string(), vec![]).unwrap();
-        let value = value_future.get().unwrap();
+        let value = client.call_sync("ping".to_string(), vec![]).unwrap().unwrap();
         assert_eq!(value, Value::String("pong".to_string()));
     }
 
@@ -217,13 +216,12 @@ mod test {
                         write_value(&mut writer, params.swap_remove(0)).unwrap(); // value
                     }));
 
-                    match method.as_slice() {
+                    match method.as_str() {
                         "quick_echo" => {
                             echo!();
                         },
                         "slow_echo" => {
-                            use std::old_io::timer::sleep;
-                            sleep(Duration::seconds(2));
+                            thread::sleep(Duration::from_secs(2));
                             echo!();
                         },
                         m => panic!("didn't expect you to call method '{}'", m),
@@ -234,10 +232,10 @@ mod test {
 
         let mut client = Client::new(::test::ChanReader(sr), ::test::ChanWriter(cw));
 
-        let mut hello_future = client.call("slow_echo".to_string(), vec![Value::String("hello".to_string())]).unwrap();
-        let mut world_future = client.call("quick_echo".to_string(), vec![Value::String("world".to_string())]).unwrap();
+        let hello_future = client.call("slow_echo".to_string(), vec![Value::String("hello".to_string())]).unwrap();
+        let world_future = client.call("quick_echo".to_string(), vec![Value::String("world".to_string())]).unwrap();
 
-        assert_eq!(hello_future.get().unwrap(), Value::String("hello".to_string()));
-        assert_eq!(world_future.get().unwrap(), Value::String("world".to_string()));
+        assert_eq!(hello_future.recv().unwrap().unwrap(), Value::String("hello".to_string()));
+        assert_eq!(world_future.recv().unwrap().unwrap(), Value::String("world".to_string()));
     }
 }
