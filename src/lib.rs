@@ -192,6 +192,7 @@ impl IntoValue for i64 { fn into_value(self) -> Value { Value::Int64(self) } }
 impl IntoValue for f32 { fn into_value(self) -> Value { Value::Float32(self) } }
 impl IntoValue for f64 { fn into_value(self) -> Value { Value::Float64(self) } }
 impl IntoValue for string::String { fn into_value(self) -> Value { Value::String(self) } }
+impl IntoValue for &'static str { fn into_value(self) -> Value { Value::String(String::from(self)) } }
 
 // TODO: re-enable this when we can specify that the implementation
 // for Vec<T> should *not* include u8
