@@ -56,7 +56,10 @@ impl<R, W> Client<R, W> where R: Read + Send + 'static, W: Write + Send {
             let mut reader = super::Reader::new(r);
             loop {
                 match reader.read_value() {
-                    Ok(value) => assert_eq!(value.int(), 1),
+                    Ok(value) => match value.int() {
+                        Ok(x) => assert_eq!(x, 1),
+                        Err(err) => panic!("error: {}", err),
+                    },
                     Err(ReadError::Unrecognized(0)) => break, // kill signal
                     Err(ReadError::NoData) => break, // eof
                     Err(e) => panic!("error: {}", e),
@@ -159,10 +162,10 @@ mod test {
             let mut reader = ::Reader::new(::test::ChanReader(cr));
             let mut writer = ::test::ChanWriter(sw);
 
-            assert_eq!(reader.read_value().unwrap().int(), 0);
-            let msgid = reader.read_value().unwrap().uint() as u32;
-            let method = reader.read_value().unwrap().string();
-            let _ = reader.read_value().unwrap().array(); // params
+            assert_eq!(reader.read_value().unwrap().int().unwrap(), 0);
+            let msgid = reader.read_value().unwrap().uint().unwrap() as u32;
+            let method = reader.read_value().unwrap().string().unwrap();
+            let _ = reader.read_value().unwrap().array().unwrap(); // params
 
             match method.as_str() {
                 "ping" => {
@@ -192,15 +195,15 @@ mod test {
 
             loop {
                 match reader.read_value() {
-                    Ok(value) => assert_eq!(value.int(), 0),
+                    Ok(value) => assert_eq!(value.int().unwrap(), 0),
                     Err(ReadError::Unrecognized(0)) => break,
                     Err(ReadError::NoData) => break,
                     x => panic!("received unexpected value '{:?}'", x),
                 }
 
-                let msgid = reader.read_value().unwrap().uint() as u32;
-                let method = reader.read_value().unwrap().string();
-                let params = reader.read_value().unwrap().array();
+                let msgid = reader.read_value().unwrap().uint().unwrap() as u32;
+                let method = reader.read_value().unwrap().string().unwrap();
+                let params = reader.read_value().unwrap().array().unwrap();
                 let sw = sw.clone();
 
                 thread::spawn(move || {
@@ -237,5 +240,20 @@ mod test {
 
         assert_eq!(hello_future.recv().unwrap().unwrap(), Value::String("hello".to_string()));
         assert_eq!(world_future.recv().unwrap().unwrap(), Value::String("world".to_string()));
+    }
+
+    /// Verify that the value is made available in case of a type error.
+    #[test] fn ownership_test() {
+        let mut v = Value::Boolean(true);
+
+        v = match v.int() {
+            Ok(_) => unreachable!(),
+            Err(err) => err.value(),
+        };
+
+        match v.bool() {
+            Ok(b) => assert_eq!(b, true),
+            Err(_) => unreachable!(),
+        };
     }
 }

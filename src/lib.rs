@@ -1,13 +1,4 @@
-//! Experimental new MessagePack implementation for Rust.
-//!
-//! This crate provides an alternative MessagePack implementation
-//! to [mneumann/rust-msgpack](http://github.com/mneumann/rust-msgpack).
-//! This implementation foregoes usage of `rustc-serialize` (at least
-//! until a new approach stabilizes) in favor of operating directly on
-//! `std::io::Read` and `std::io::Write`.
-//!
-//! Better serialization sugar is planned, but for now, here's how you
-//! would open up a connection and send a value to it:
+//! A MessagePack implementation for Rust.
 //!
 //! ~~~ignore
 //! use std::net::TcpStream;
@@ -15,9 +6,8 @@
 //!
 //! let mut conn = TcpStream::connect("127.0.0.1:8081").unwrap();
 //!
-//! // write some values
-//! write_value(&mut conn, Value::Int32(3)).unwrap();
-//! write_value(&mut conn, Value::String("hello world".to_string())).unwrap();
+//! // write values
+//! write(&mut conn, 3 as i32).unwrap();
 //! ~~~
 //!
 //! Reading values is just as easy:
@@ -29,15 +19,8 @@
 //! let mut conn = TcpStream::connect("127.0.0.1:8081").unwrap();
 //! let mut reader = Reader::new(conn);
 //!
-//! match reader.read_value().unwrap() {
-//!     Value::Int32(x) => assert_eq!(x, 3),
-//!     _ => panic!("received unexpected value"),
-//! }
-//!
-//! match reader.read_value().unwrap() {
-//!     Value::String(str) => println!("{}", str),
-//!     _ => panic!("received unexpected value"),
-//! }
+//! let value = reader.read_value().unwrap();
+//! // `value` can be inspected with `match` or converted directly with a convenience method
 //! ~~~
 
 #![crate_type = "lib"]
@@ -74,58 +57,120 @@ pub enum Value {
     String(string::String),
     Binary(Vec<u8>),
     Array(Vec<Value>),
-    Map(Vec<(Value, Value)>),
-
-    // Still need to implement.
+    Map(ValueMap),
     Extended(i8, Vec<u8>),
 }
 
 impl Value {
-    fn int(self) -> i64 {
-        use Value::*;
-        match self {
-            Int8(i) => i as i64,
-            Int16(i) => i as i64,
-            Int32(i) => i as i64,
-            Int64(i) => i,
-            x => panic!("'{:?}' does not contain an int value", x),
-        }
-    }
-
-    fn uint(self) -> u64 {
-        use Value::*;
-        match self {
-            Uint8(i) => i as u64,
-            Uint16(i) => i as u64,
-            Uint32(i) => i as u64,
-            Uint64(i) => i,
-            x => panic!("'{:?}' does not contain a uint value", x),
-        }
-    }
-
-    fn string(self) -> string::String {
-        match self {
-            Value::String(s) => s,
-            _ => panic!("not a string value"),
-        }
-    }
-
-    fn array(self) -> Vec<Value> {
-        match self {
-            Value::Array(ar) => ar,
-            _ => panic!("not an array value"),
-        }
-    }
-
-    fn get<T: IntoValue>(&self, key: T) -> Option<&Value> {
-        let key = key.into_value();
+    pub fn is_nil(&self) -> bool {
         match *self {
-            Value::Map(ref map) => {
-                map.iter().find(|&&(ref k, _)| *k == key).map(|&(_, ref v)| v)
-            },
-            _ => panic!("not a map value"),
+            Value::Nil => true,
+            _ => false,
         }
     }
+
+    pub fn bool(self) -> Result<bool, TypeError> {
+        use Value::*;
+        match self {
+            Boolean(b) => Ok(b),
+            v => Err(TypeError{desc: format!("{:?} does not contain a boolean value", v), v: v}),
+        }
+    }
+
+    pub fn int(self) -> Result<i64, TypeError> {
+        use Value::*;
+        match self {
+            Int8(i) => Ok(i as i64),
+            Int16(i) => Ok(i as i64),
+            Int32(i) => Ok(i as i64),
+            Int64(i) => Ok(i),
+            v => Err(TypeError{desc: format!("{:?} does not contain an int value", v), v: v}),
+        }
+    }
+
+    pub fn uint(self) -> Result<u64, TypeError> {
+        use Value::*;
+        match self {
+            Uint8(i) => Ok(i as u64),
+            Uint16(i) => Ok(i as u64),
+            Uint32(i) => Ok(i as u64),
+            Uint64(i) => Ok(i),
+            v => Err(TypeError{desc: format!("{:?} does not contain a uint value", v), v: v}),
+        }
+    }
+
+    pub fn float(self) -> Result<f64, TypeError> {
+        use Value::*;
+        match self {
+            Float32(f) => Ok(f as f64),
+            Float64(f) => Ok(f),
+            v => Err(TypeError{desc: format!("{:?} does not contain a float value", v), v: v}),
+        }
+    }
+
+    pub fn string(self) -> Result<string::String, TypeError> {
+        match self {
+            Value::String(s) => Ok(s),
+            v => Err(TypeError{desc: format!("{:?} does not contain a string value", v), v: v}),
+        }
+    }
+
+    pub fn binary(self) -> Result<Vec<u8>, TypeError> {
+        match self {
+            Value::Binary(data) => Ok(data),
+            v => Err(TypeError{desc: format!("{:?} does not contain a binary value", v), v: v}),
+        }
+    }
+
+    pub fn array(self) -> Result<Vec<Value>, TypeError> {
+        match self {
+            Value::Array(ar) => Ok(ar),
+            v => Err(TypeError{desc: format!("{:?} does not contain an array value", v), v: v}),
+        }
+    }
+
+    pub fn map(self) -> Result<ValueMap, TypeError> {
+        match self {
+            Value::Map(m) => Ok(m),
+            v => Err(TypeError{desc: format!("{:?} does not contain a map value", v), v: v}),
+        }
+    }
+
+    pub fn extended_type(&self) -> Option<i8> {
+        match *self {
+            Value::Extended(x, _) => Some(x),
+            _ => None,
+        }
+    }
+
+    pub fn extended_data(self) -> Option<Vec<u8>> {
+        match self {
+            Value::Extended(_, data) => Some(data),
+            _ => None,
+        }
+    }
+
+    pub fn extended<T>(self) -> Result<T, TypeError> {
+        use Value::*;
+        match self {
+            Extended(_, data) => Ok(unsafe { std::mem::transmute_copy(&data[0]) }),
+            v => Err(TypeError{desc: format!("{:?} does not contain an extended value", v), v: v})
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct ValueMap(pub Vec<(Value, Value)>);
+
+impl ValueMap {
+    /// Retrieve a value from the map.
+    pub fn get<T: IntoValue>(&self, key: T) -> Option<&Value> {
+        let key = key.into_value();
+        self.0.iter().find(|&&(ref k, _)| *k == key).map(|&(_, ref v)| v)
+    }
+
+    /// Returns the number of key/value pairs in the map.
+    pub fn len(&self) -> usize { self.0.len() }
 }
 
 /// A trait for types that can be written via MessagePack. This is mostly
@@ -345,7 +390,7 @@ impl<R: Read + Send> Reader<R> {
                 for _ in 0..n {
                     m.push((try!(self.read_value()), try!(self.read_value())));
                 }
-                Ok(Map(m))
+                Ok(Map(ValueMap(m)))
             },
 
             byte::MAP16 => {
@@ -354,7 +399,7 @@ impl<R: Read + Send> Reader<R> {
                 for _ in 0..n {
                     m.push((try!(self.read_value()), try!(self.read_value())));
                 }
-                Ok(Map(m))
+                Ok(Map(ValueMap(m)))
             },
 
             byte::MAP32 => {
@@ -363,7 +408,7 @@ impl<R: Read + Send> Reader<R> {
                 for _ in 0..n {
                     m.push((try!(self.read_value()), try!(self.read_value())));
                 }
-                Ok(Map(m))
+                Ok(Map(ValueMap(m)))
             },
 
             // Extension types.
@@ -401,14 +446,15 @@ pub fn write<W: Write, V: IntoValue>(dest: &mut W, val: V) -> Result<(), WriteEr
     write_value(dest, val.into_value())
 }
 
-/// Write any value as an Extended type.
+/// Write any value as an Extended type. On success, returns the number of bytes written.
 ///
 /// The `val` parameter will be automatically converted to its byte representation.
-pub fn write_ext<W: Write, T>(dest: &mut W, id: i8, val: T) -> Result<(), WriteError> {
+pub fn write_ext<W: Write, T>(dest: &mut W, id: i8, val: T) -> Result<usize, WriteError> {
     let data: &[u8] = unsafe {
         slice::from_raw_parts(&val as *const _ as *const u8, std::mem::size_of::<T>())
     };
-    write_value(dest, Value::Extended(id, data.to_vec()))
+    try!(write_value(dest, Value::Extended(id, data.to_vec())));
+    Ok(data.len())
 }
 
 /// Write a message in MessagePack format for the given value.
@@ -504,7 +550,7 @@ pub fn write_value<W: Write>(dest: &mut W, val: Value) -> Result<(), WriteError>
                 65536...4294967295 => Ok(try!(dest.write_all(data![byte::MAP32; be_int!(n, u32, 4)]))), // 32 map
                 _ => Err(WriteError::TooMuchData(n)),
             });
-            for (k, v) in entries.into_iter() {
+            for (k, v) in entries.0.into_iter() {
                 try!(write_value(dest, k));
                 try!(write_value(dest, v));
             }
@@ -531,6 +577,28 @@ pub fn write_value<W: Write>(dest: &mut W, val: Value) -> Result<(), WriteError>
 }
 
 /* -- Errors -- */
+
+#[derive(Debug)]
+pub struct TypeError {
+    v: Value,
+    desc: String,
+}
+
+impl TypeError {
+    /// Retrieve the value that caused the type error.
+    pub fn value(self) -> Value { self.v }
+}
+
+impl Error for TypeError {
+    fn description(&self) -> &str { self.desc.as_str() }
+    fn cause(&self) -> Option<&Error> { None }
+}
+
+impl std::fmt::Display for TypeError {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(fmt, "{}", self)
+    }
+}
 
 /// An error encountered while trying to write a value.
 #[derive(Debug)]
@@ -603,8 +671,10 @@ mod test {
     extern crate rand;
 
     use std::io::{self, Read, Write};
-    use std::sync::mpsc::{channel, Sender, Receiver};
+    use std::mem;
+    use std::slice;
     use std::string;
+    use std::sync::mpsc::{channel, Sender, Receiver};
     use self::rand::{Rng, StdRng};
     use super::{IntoValue, write_value};
 
@@ -686,4 +756,24 @@ mod test {
     #[test] fn write_tiny_string() { test(random_string(8)); }
     #[test] fn write_short_string() { test(random_string(32)); }
     #[test] fn write_medium_string() { test(random_string(256)); }
+
+    #[repr(packed)]
+    struct CustomStruct {
+        a: i8,
+        b: i16,
+    }
+
+    /// Note that extended values cannot include pointers to outside data.
+    #[test] fn test_extended() {
+        let (tx, rx) = channel();
+        let written = super::write_ext(&mut ChanWriter(tx), 13, CustomStruct{a: 13, b: 42}).unwrap();
+        assert_eq!(written, 3);
+
+        let value = super::Reader::new(&mut ChanReader(rx)).read_value().unwrap();
+        assert_eq!(value.extended_type().unwrap(), 13);
+
+        let x: CustomStruct = value.extended().unwrap();
+        assert_eq!(x.a, 13);
+        assert_eq!(x.b, 42);
+    }
 }
