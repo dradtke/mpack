@@ -714,8 +714,6 @@ mod test {
     extern crate rand;
 
     use std::io::{self, Read, Write};
-    use std::mem;
-    use std::slice;
     use std::string;
     use std::sync::mpsc::{channel, Sender, Receiver};
     use self::rand::{Rng, StdRng};

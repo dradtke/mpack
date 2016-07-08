@@ -163,7 +163,7 @@ mod test {
     use std::time::Duration;
 
     use super::Client;
-    use super::super::{Value, ReadError, write, write_value};
+    use super::super::{ReadError, Value, write_value};
 
     // This test just calls a method "ping" and expects the result "pong".
     #[test] fn simple_test() {
@@ -174,17 +174,20 @@ mod test {
             let mut reader = ::Reader::new(::test::ChanReader(cr));
             let mut writer = ::test::ChanWriter(sw);
 
-            assert_eq!(reader.read_value().unwrap().int().unwrap(), 0);
-            let msgid = reader.read_value().unwrap().uint().unwrap() as u32;
-            let method = reader.read_value().unwrap().string().unwrap();
-            let _ = reader.read_value().unwrap().array().unwrap(); // params
+            let response = reader.read_value().unwrap().array().unwrap();
+            assert_eq!(response[0].clone().int().unwrap(), 0);
+            let msgid = response[1].clone().uint().unwrap() as u32;
+            let method = response[2].clone().string().unwrap();
+            let _ = response[3].clone().array().unwrap(); // params
 
             match method.as_str() {
                 "ping" => {
-                    write(&mut writer, 1 as i8).unwrap();
-                    write_value(&mut writer, Value::Uint32(msgid)).unwrap();
-                    write(&mut writer, ()).unwrap(); // error
-                    write(&mut writer, "pong".to_string()).unwrap(); // value
+                    write_value(&mut writer, Value::Array(vec![
+                        Value::Int8(1 as i8),
+                        Value::Uint32(msgid),
+                        Value::Nil,
+                        Value::String(String::from("pong")),
+                    ])).unwrap();
                 },
                 m => panic!("didn't expect you to call method '{}'", m),
             }
@@ -207,41 +210,47 @@ mod test {
 
             loop {
                 match reader.read_value() {
-                    Ok(value) => assert_eq!(value.int().unwrap(), 0),
+                    Ok(value) => match value.array() {
+                        Ok(response) => {
+                            assert_eq!(response[0].clone().int().unwrap(), 0);
+                            let msgid = response[1].clone().uint().unwrap() as u32;
+                            let method = response[2].clone().string().unwrap();
+                            let params = response[3].clone().array().unwrap();
+                            let sw = sw.clone();
+
+                            thread::spawn(move || {
+                                let msgid = msgid;
+                                let method = method;
+                                let mut params = params;
+                                let mut writer = ::test::ChanWriter(sw);
+
+                                macro_rules! echo(() => ({
+                                    write_value(&mut writer, Value::Array(vec![
+                                        Value::Int8(1 as i8),
+                                        Value::Uint32(msgid),
+                                        Value::Nil,
+                                        params.swap_remove(0),
+                                    ])).unwrap();
+                                }));
+
+                                match method.as_str() {
+                                    "quick_echo" => {
+                                        echo!();
+                                    },
+                                    "slow_echo" => {
+                                        thread::sleep(Duration::from_secs(2));
+                                        echo!();
+                                    },
+                                    m => panic!("didn't expect you to call method '{}'", m),
+                                }
+                            });
+                        },
+                        _ => (),
+                    },
                     Err(ReadError::Unrecognized(0)) => break,
                     Err(ReadError::NoData) => break,
-                    x => panic!("received unexpected value '{:?}'", x),
+                    Err(e) => panic!("{:?}", e),
                 }
-
-                let msgid = reader.read_value().unwrap().uint().unwrap() as u32;
-                let method = reader.read_value().unwrap().string().unwrap();
-                let params = reader.read_value().unwrap().array().unwrap();
-                let sw = sw.clone();
-
-                thread::spawn(move || {
-                    let msgid = msgid;
-                    let method = method;
-                    let mut params = params;
-                    let mut writer = ::test::ChanWriter(sw);
-
-                    macro_rules! echo(() => ({
-                        write(&mut writer, 1 as i8).unwrap();
-                        write_value(&mut writer, Value::Uint32(msgid)).unwrap();
-                        write(&mut writer, ()).unwrap(); // error
-                        write_value(&mut writer, params.swap_remove(0)).unwrap(); // value
-                    }));
-
-                    match method.as_str() {
-                        "quick_echo" => {
-                            echo!();
-                        },
-                        "slow_echo" => {
-                            thread::sleep(Duration::from_secs(2));
-                            echo!();
-                        },
-                        m => panic!("didn't expect you to call method '{}'", m),
-                    }
-                });
             }
         });
 
