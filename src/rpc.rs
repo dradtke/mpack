@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread::{self, JoinHandle};
 
-use super::{Value, ReadError, WriteError, write, write_value};
+use super::{Value, ReadError, WriteError, write_value};
 
 static MSGID: AtomicUsize = ATOMIC_USIZE_INIT;
 
@@ -17,10 +17,10 @@ type PendingData = Arc<Mutex<HashMap<u32, Sender<RpcResult>>>>;
 /// `Client` represents a connection to some server that accepts
 /// MessagePack RPC requests.
 pub struct Client<R: Read + Send + 'static, W: Write + Send> {
-    input: PhantomData<R>, // the reader instance is effectively owned by the dispatch thread
+    input: PhantomData<R>, // the reader instance is effectively owned by the main loop
     output: W,
     pending: PendingData,
-    dispatch_join_handle: JoinHandle<()>,
+    main_loop_handle: JoinHandle<()>,
 }
 
 impl<R, W> Client<R, W> where R: Read + Send + 'static, W: Write + Send {
@@ -36,7 +36,7 @@ impl<R, W> Client<R, W> where R: Read + Send + 'static, W: Write + Send {
 
     /// Construct a new Client instance.
     ///
-    /// This will spawn a scoped dispatch thread which will take ownership of the `Read`
+    /// This will spawn a main loop thread which will take ownership of the `Read`
     /// instance, and which will exit when it detects EOF, or when it receives a 0 in lieu
     /// of a MessagePack data type identifier.
     pub fn new(reader: R, writer: W) -> Client<R, W> {
@@ -45,56 +45,8 @@ impl<R, W> Client<R, W> where R: Read + Send + 'static, W: Write + Send {
             input: PhantomData,
             output: writer,
             pending: pending.clone(),
-            dispatch_join_handle: Client::<R, W>::dispatch_thread(reader, pending),
+            main_loop_handle: Client::<R, W>::main_loop(reader, pending),
         }
-    }
-
-    /// Runs a scoped thread for dispatching messages received from reader to the appropriate parties.
-    fn dispatch_thread(reader: R, pending: PendingData) -> JoinHandle<()> {
-        thread::spawn(move || {
-            let r = reader;
-            let mut reader = super::Reader::new(r);
-            loop {
-                match reader.read_value() {
-                    Ok(value) => match value.int() {
-                        Ok(x) => assert_eq!(x, 1),
-                        Err(err) => panic!("error: {}", err),
-                    },
-                    Err(ReadError::Unrecognized(0)) => break, // kill signal
-                    Err(ReadError::NoData) => break, // eof
-                    Err(e) => panic!("error: {}", e),
-                }
-
-                match reader.read_value() {
-                    Ok(Value::Uint32(msgid)) => {
-                        let responder: Sender<RpcResult> = pending.lock().unwrap().remove(&msgid).unwrap();
-
-                        let err = reader.read_value().unwrap();
-                        let res = reader.read_value().unwrap();
-
-                        responder.send(if err == Value::Nil { Ok(res) } else { Err(err) }).unwrap();
-                    },
-                    Ok(value) => panic!("received value, but it wasn't a u32: {:?}", value),
-                    Err(e) => panic!("failed to receive value: {:?}", e),
-                }
-            }
-        })
-    }
-
-    /// Helper for calling methods via RPC.
-    fn do_call(&mut self, method: String, params: Vec<Value>) -> Result<Receiver<RpcResult>, WriteError> {
-        try!(write_value(&mut self.output, Value::Int8(0))); // for method call
-
-        let msgid = MSGID.fetch_add(1, Ordering::SeqCst) as u32;
-        let (responder, listener) = channel();
-        self.pending.lock().unwrap().insert(msgid, responder);
-
-        try!(write(&mut self.output, msgid));
-        try!(write(&mut self.output, method));
-        try!(write_value(&mut self.output, Value::Array(params)));
-        try!(self.output.flush());
-
-        Ok(listener)
     }
 
     /// Call a method via RPC and receive the response as a Receiver.
@@ -131,6 +83,66 @@ impl<R, W> Client<R, W> where R: Read + Send + 'static, W: Write + Send {
     /// to make the call. An `Ok` value will contain the server's response.
     pub fn call_sync(&mut self, method: String, params: Vec<Value>) -> Result<RpcResult, WriteError> {
         Ok(try!(self.do_call(method, params)).recv().unwrap())
+    }
+
+    /// Runs a scoped thread for dispatching messages received from reader to the appropriate parties.
+    fn main_loop(reader: R, pending: PendingData) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let r = reader;
+            let mut reader = super::Reader::new(r);
+            loop {
+                match reader.read_value() {
+                    Ok(value) => match value.array() {
+                        Ok(response) => {
+                            match response[0].clone().int().unwrap() {
+                                1 => {
+                                    let msgid = match response[1].clone() {
+                                        Value::Int8(i) => i as u32,
+                                        Value::Int16(i) => i as u32,
+                                        Value::Int32(i) => i as u32,
+                                        Value::Uint8(u) => u as u32,
+                                        Value::Uint16(u) => u as u32,
+                                        Value::Uint32(u) => u as u32,
+                                        x => panic!("received unexpected msgid value: {:?}", x),
+                                    };
+                                    let responder: Sender<RpcResult> = pending.lock().unwrap().remove(&msgid).unwrap();
+
+                                    let error = response[2].clone();
+                                    if !error.is_nil() {
+                                        responder.send(Err(error)).unwrap();
+                                    } else {
+                                        let result = response[3].clone();
+                                        responder.send(Ok(result)).unwrap();
+                                    }
+                                },
+                                _ => (),
+                            }
+                        },
+                        Err(_) => (),
+                    },
+                    Err(ReadError::Unrecognized(0)) => break, // kill signal
+                    Err(ReadError::NoData) => break, // eof
+                    Err(e) => panic!("error: {}", e),
+                }
+            }
+        })
+    }
+
+    /// Helper for calling methods via RPC.
+    fn do_call(&mut self, method: String, params: Vec<Value>) -> Result<Receiver<RpcResult>, WriteError> {
+        let msgid = MSGID.fetch_add(1, Ordering::SeqCst) as u32;
+        let (responder, listener) = channel();
+        self.pending.lock().unwrap().insert(msgid, responder);
+
+        try!(write_value(&mut self.output, Value::Array(vec![
+            Value::Int8(0),
+            Value::Uint32(msgid),
+            Value::String(method),
+            Value::Array(params),
+        ])));
+        try!(self.output.flush());
+
+        Ok(listener)
     }
 }
 

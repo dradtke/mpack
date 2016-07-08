@@ -169,6 +169,18 @@ impl ValueMap {
         self.0.iter().find(|&&(ref k, _)| *k == key).map(|&(_, ref v)| v)
     }
 
+    pub fn get_array<T: IntoValue>(&self, key: T) -> Option<Vec<Value>> {
+        self.get(key).map(|v| v.clone().array().unwrap())
+    }
+
+    pub fn get_bool<T: IntoValue>(&self, key: T) -> Option<bool> {
+        self.get(key).map(|v| v.clone().bool().unwrap())
+    }
+
+    pub fn get_string<T: IntoValue>(&self, key: T) -> Option<String> {
+        self.get(key).map(|v| v.clone().string().unwrap())
+    }
+
     /// Returns the number of key/value pairs in the map.
     pub fn len(&self) -> usize { self.0.len() }
 }
@@ -293,6 +305,34 @@ impl<R: Read + Send> Reader<R> {
         );
 
         match b[0] {
+            b @ byte::FIXINT_POS_RANGE_START...byte::FIXINT_POS_RANGE_END => Ok(Int8((b & 0b01111111) as i8)),
+
+            b @ byte::FIXMAP_RANGE_START...byte::FIXMAP_RANGE_END => {
+                let n = (b & 0b00001111) as usize;
+                let mut m = Vec::with_capacity(n);
+                for _ in 0..n {
+                    m.push((try!(self.read_value()), try!(self.read_value())));
+                }
+                Ok(Map(ValueMap(m)))
+            }
+
+            b @ byte::FIXARRAY_RANGE_START...byte::FIXARRAY_RANGE_END => {
+                let n = (b & 0b00001111) as usize;
+                let mut ar = Vec::with_capacity(n);
+                for _ in 0..n {
+                    ar.push(try!(self.read_value()));
+                }
+                Ok(Array(ar))
+            },
+
+            b @ byte::FIXSTR_RANGE_START...byte::FIXSTR_RANGE_END => {
+                let n = (b & 0b00011111) as usize;
+                match string::String::from_utf8(read_exact!(self.reader, n)) {
+                    Ok(s) => Ok(String(s)),
+                    Err(_) => panic!("received invalid utf-8"),
+                }
+            },
+
             byte::NIL => Ok(Nil),
 
             byte::FALSE => Ok(Boolean(false)),
@@ -434,9 +474,11 @@ impl<R: Read + Send> Reader<R> {
                 Ok(Extended(read_be_int!(self.reader, i8, 1), read_exact!(self.reader, n)))
             },
 
-            x => {
-                self.next_byte = Some(x);
-                Err(ReadError::Unrecognized(x))
+            b @ byte::FIXINT_NEG_RANGE_START...byte::FIXINT_NEG_RANGE_END => Ok(Int8((b & 0b00011111) as i8)),
+
+            b => {
+                self.next_byte = Some(b);
+                Err(ReadError::Unrecognized(b))
             },
         }
     }
